@@ -1,5 +1,3 @@
-Yes. I’ll keep the same code, add comments that explain the reasoning, components, and interaction, and put the entire thing into one copy-paste block.
-
 -- DirectionalDashConfig
 -- This module keeps all dash values in one shared location so both the client
 -- and server use identical timing, distance, visual, and animation settings.
