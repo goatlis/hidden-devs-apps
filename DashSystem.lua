@@ -1,800 +1,776 @@
--- DirectionalDashConfig
--- This module keeps all dash values in one shared location so both the client
--- and server use identical timing, distance, visual, and animation settings.
-return {
-    -- The server uses this value to determine how long the dash movement exists.
-    -- Keeping duration in the config allows movement, visuals, and animations
-    -- to synchronize without each system having its own hardcoded timing.
-    DashDuration = 10 / 60,
-    -- The server uses this as the total horizontal distance the dash should cover.
-    -- The client never controls this value, keeping the actual movement server-sided.
-    DashDistance = 18,
-    -- This prevents repeated RemoteEvent requests from creating unwanted dashes.
-    -- It is checked on the server because a client-side cooldown can be bypassed.
-    Cooldown = 0.65,
-    -- These values divide the visual effect into fade-out, invisible, and fade-in phases.
-    -- They are separate from movement so the visual effect can be adjusted independently.
-    FadeOutTime = 0.025,
-    InvisibleTime = 0.085,
-    FadeInTime = 0.056666,
-    -- Direction names are shared between the input system, server movement system,
-    -- and animation system so every part of the dash uses the same direction reference.
-    AnimationIds = {
-        Front = "rbxassetid://",
-        Back = "rbxassetid://",
-        Right = "rbxassetid://",
-        Left = "rbxassetid://", -- sorry i didnt have any animations
-    },
-}
--- DirectionalDashServer
--- The server is responsible for validating requests and controlling actual movement.
--- This prevents the client from deciding its own dash distance, cooldown, or direction.
+-- Discord: g1atlis | Roblox: Skibidi_goatlis
+
+--// SERVICES
 local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RunService = game:GetService("RunService")
--- The server and client both require the same module so timing and configuration
--- remain synchronized instead of having separate values that could become inconsistent.
-local Config = require(ReplicatedStorage:WaitForChild("DirectionalDashConfig"))
--- Keeping the RemoteEvents inside one folder gives the client a predictable
--- communication interface for sending requests and receiving confirmed dashes.
-local remotes = ReplicatedStorage:FindFirstChild("DirectionalDashRemotes")
-if not remotes then
-    remotes = Instance.new("Folder")
-    remotes.Name = "DirectionalDashRemotes"
-    remotes.Parent = ReplicatedStorage
-end
--- DashRequest is intentionally a request rather than direct movement control.
--- The client tells the server what it wants, and the server decides whether it is valid.
-local dashRequest = remotes:FindFirstChild("DashRequest")
-if not dashRequest then
-    dashRequest = Instance.new("RemoteEvent")
-    dashRequest.Name = "DashRequest"
-    dashRequest.Parent = remotes
-end
--- DashStarted is used after validation so every client can synchronize the
--- visual animation with the movement that the server has already approved.
-local dashStarted = remotes:FindFirstChild("DashStarted")
-if not dashStarted then
-    dashStarted = Instance.new("RemoteEvent")
-    dashStarted.Name = "DashStarted"
-    dashStarted.Parent = remotes
-end
--- This whitelist prevents arbitrary direction strings from reaching the movement logic.
--- It also gives the server a fixed set of directions that the client is allowed to request.
-local validDirections = {
-    Front = true,
-    Back = true,
-    Left = true,
-    Right = true,
-}
--- activeDashes stores the complete state of each player's current dash so that
--- movement, cleanup, death handling, and character removal all reference the same state.
-local activeDashes = {}
--- lastDashAt provides server-side cooldown validation independently from the client.
-local lastDashAt = {}
--- Each dash receives a unique token so delayed cleanup from an older dash cannot
--- accidentally terminate a newer dash belonging to the same player.
-local serial = 0
--- Direction vectors are flattened onto the XZ plane because this dash is intended
--- to move horizontally rather than using the character's vertical facing direction.
-local function flattenUnit(vector, fallback)
-    local flat = Vector3.new(vector.X, 0, vector.Z)
-    if flat.Magnitude < 0.001 then
-        return fallback
-    end
-    return flat.Unit
-end
--- The character's current CFrame is used as the reference frame so Front/Back/Left/Right
--- remain relative to where the character is facing rather than fixed world directions.
-local function getDashVector(root, directionName)
-    local forward = flattenUnit(root.CFrame.LookVector, Vector3.new(0, 0, -1))
-    local right = flattenUnit(root.CFrame.RightVector, Vector3.new(1, 0, 0))
-    if directionName == "Back" then
-        return -forward
-    elseif directionName == "Left" then
-        return -right
-    elseif directionName == "Right" then
-        return right
-    end
-    return forward
-end
--- Linear interpolation is used here because transparency needs a gradual transition
--- between the character's original value and completely invisible.
-local function lerpNumber(from, to, alpha)
-    return from + (to - from) * alpha
-end
--- Particle, trail, and beam transparency uses NumberSequence rather than a single number.
--- Rebuilding its keypoints allows the same fade interpolation to work on those objects.
-local function fadeNumberSequence(sequence, alpha)
-    local keypoints = table.create(#sequence.Keypoints)
-    for index, keypoint in ipairs(sequence.Keypoints) do
-        keypoints[index] = NumberSequenceKeypoint.new(
-            keypoint.Time,
-            lerpNumber(keypoint.Value, 1, alpha),
-            keypoint.Envelope
-        )
-    end
-    return NumberSequence.new(keypoints)
-end
--- Visual properties are captured before changing anything so the dash effect can
--- restore custom character appearances instead of assuming default transparency values.
-local function captureVisuals(character)
-    local root = character:FindFirstChild("HumanoidRootPart")
-    local originals = {}
-    for _, instance in ipairs(character:GetDescendants()) do
-        if instance:IsA("BasePart") then
-            originals[instance] = {
-                kind = "number",
-                value = instance.Transparency,
-            }
-        elseif instance:IsA("Decal") or instance:IsA("Texture") then
-            originals[instance] = {
-                kind = "number",
-                value = instance.Transparency,
-            }
-        elseif instance:IsA("ParticleEmitter")
-            or instance:IsA("Trail")
-            or instance:IsA("Beam") then
-            originals[instance] = {
-                kind = "sequence",
-                value = instance.Transparency,
-            }
-        elseif instance:IsA("Highlight") then
-            originals[instance] = {
-                kind = "highlight",
-                fill = instance.FillTransparency,
-                outline = instance.OutlineTransparency,
-            }
-        end
-    end
-    -- The same captured values are used during the effect so every visual component
-    -- fades relative to its original appearance instead of always starting at zero.
-    local function apply(alpha)
-        for instance, original in pairs(originals) do
-            if instance.Parent then
-                if instance == root then
-                    instance.Transparency = 1
-                elseif original.kind == "number" then
-                    instance.Transparency = lerpNumber(original.value, 1, alpha)
-                elseif original.kind == "sequence" then
-                    instance.Transparency = fadeNumberSequence(original.value, alpha)
-                elseif original.kind == "highlight" then
-                    instance.FillTransparency = lerpNumber(original.fill, 1, alpha)
-                    instance.OutlineTransparency = lerpNumber(original.outline, 1, alpha)
-                end
-            end
-        end
-    end
-    -- Restoration is kept separate from applying the effect so cleanup can always
-    -- return the character to the exact visual state it had before the dash.
-    local function restore()
-        for instance, original in pairs(originals) do
-            if instance.Parent then
-                if instance == root then
-                    instance.Transparency = 1
-                elseif original.kind == "number" then
-                    instance.Transparency = original.value
-                elseif original.kind == "sequence" then
-                    instance.Transparency = original.value
-                elseif original.kind == "highlight" then
-                    instance.FillTransparency = original.fill
-                    instance.OutlineTransparency = original.outline
-                end
-            end
-        end
-    end
-    return apply, restore
-end
--- This function owns the complete visual timeline so visual timing stays tied
--- to the dash duration without affecting the actual movement controller.
-local function beginVisualEffect(character, duration)
-    local apply, restore = captureVisuals(character)
-    local fadeOut = math.clamp(Config.FadeOutTime, 0, duration)
-    local invisible = math.clamp(Config.InvisibleTime, 0, duration - fadeOut)
-    local fadeIn = math.clamp(Config.FadeInTime, 0, duration - fadeOut - invisible)
-    local startedAt = os.clock()
-    local connection
-    local stopped = false
-    apply(0)
-    -- stop() centralizes cleanup so the Heartbeat connection and character visuals
-    -- are restored exactly once even if multiple cleanup paths attempt to finish the dash.
-    local function stop()
-        if stopped then
-            return
-        end
-        stopped = true
-        if connection then
-            connection:Disconnect()
-            connection = nil
-        end
-        restore()
-    end
-    -- Heartbeat is used because the visual transition needs continuous frame updates
-    -- while remaining synchronized with the server's elapsed dash time.
-    connection = RunService.Heartbeat:Connect(function()
-        local elapsed = os.clock() - startedAt
-        if elapsed < fadeOut and fadeOut > 0 then
-            apply(elapsed / fadeOut)
-        elseif elapsed < fadeOut + invisible then
-            apply(1)
-        elseif elapsed < duration and fadeIn > 0 then
-            apply(1 - ((elapsed - fadeOut - invisible) / fadeIn))
-        else
-            apply(0)
-            stop()
-        end
-    end)
-    return stop
-end
--- The humanoid is temporarily locked because normal walking, jumping, and rotation
--- would otherwise compete with the server-controlled dash movement.
-local function lockHumanoid(humanoid)
-    -- Saving these properties allows the system to support characters with custom
-    -- movement settings instead of forcing default Roblox values after the dash.
-    local saved = {
-        WalkSpeed = humanoid.WalkSpeed,
-        AutoRotate = humanoid.AutoRotate,
-        JumpPower = humanoid.JumpPower,
-        JumpHeight = humanoid.JumpHeight,
-        JumpingEnabled = humanoid:GetStateEnabled(Enum.HumanoidStateType.Jumping),
-        ClimbingEnabled = humanoid:GetStateEnabled(Enum.HumanoidStateType.Climbing),
-    }
-    humanoid.WalkSpeed = 0
-    humanoid.AutoRotate = false
-    humanoid.JumpPower = 0
-    humanoid.JumpHeight = 0
-    humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, false)
-    humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, false)
-    humanoid.Jump = false
-    humanoid:Move(Vector3.zero, true)
-    -- Returning a restore function lets finishDash handle all humanoid cleanup
-    -- from one place regardless of whether the dash ends normally or unexpectedly.
-    local restored = false
-    return function()
-        if restored then
-            return
-        end
-        restored = true
-        if not humanoid.Parent then
-            return
-        end
-        humanoid.WalkSpeed = saved.WalkSpeed
-        humanoid.AutoRotate = saved.AutoRotate
-        humanoid.JumpPower = saved.JumpPower
-        humanoid.JumpHeight = saved.JumpHeight
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Jumping, saved.JumpingEnabled)
-        humanoid:SetStateEnabled(Enum.HumanoidStateType.Climbing, saved.ClimbingEnabled)
-    end
-end
--- All dash cleanup is centralized here so movement objects, connections, visuals,
--- and humanoid restrictions cannot remain active after the dash has ended.
-local function finishDash(player, token)
-    local state = activeDashes[player]
-    -- The token check protects newer dashes from cleanup belonging to an older dash.
-    if not state or state.token ~= token then
-        return
-    end
-    activeDashes[player] = nil
-    -- Connections are disconnected first because leaving them active would allow
-    -- old callbacks to continue modifying the character after the dash is finished.
-    if state.movementConnection then
-        state.movementConnection:Disconnect()
-        state.movementConnection = nil
-    end
-    if state.diedConnection then
-        state.diedConnection:Disconnect()
-        state.diedConnection = nil
-    end
-    if state.characterAncestryConnection then
-        state.characterAncestryConnection:Disconnect()
-        state.characterAncestryConnection = nil
-    end
-    -- These physics objects only exist for the dash, so keeping them afterward
-    -- would allow unintended movement or unnecessary instances to accumulate.
-    if state.velocity and state.velocity.Parent then
-        state.velocity:Destroy()
-    end
-    if state.attachment and state.attachment.Parent then
-        state.attachment:Destroy()
-    end
-    -- Only horizontal dash momentum is removed; the Y velocity is preserved so
-    -- falling or other vertical physics are not artificially interrupted.
-    if state.root and state.root.Parent then
-        local currentVelocity = state.root.AssemblyLinearVelocity
-        state.root.AssemblyLinearVelocity = Vector3.new(0, currentVelocity.Y, 0)
-    end
-    -- These returned functions restore the two systems that were temporarily changed:
-    -- character visibility and normal humanoid movement.
-    if state.stopVisuals then
-        state.stopVisuals()
-    end
-    if state.restoreHumanoid then
-        state.restoreHumanoid()
-    end
-end
--- This is the server's main validation point. The client provides intent,
--- while this function decides whether the requested dash can actually happen.
-local function startDash(player, directionName)
-    if not validDirections[directionName] then
-        return
-    end
-    -- Cooldown validation happens here rather than only on the client because
-    -- RemoteEvents can be manually fired by an exploiter.
-    local now = os.clock()
-    local last = lastDashAt[player] or -math.huge
-    if now - last < Config.Cooldown then
-        return
-    end
-    local character = player.Character
-    if not character then
-        return
-    end
-    -- These references are required because the dash depends on both humanoid
-    -- state and the root part's orientation/physics.
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    local root = character:FindFirstChild("HumanoidRootPart")
-    if not humanoid or not root or humanoid.Health <= 0 then
-        return
-    end
-    -- Prevents overlapping dash states from competing over the same character.
-    if activeDashes[player] then
-        return
-    end
-    lastDashAt[player] = now
-    serial += 1
-    -- The token gives this dash a unique identity for delayed cleanup and callbacks.
-    local token = serial
-    -- Direction is calculated once from the character's orientation so the dash
-    -- continues in the requested direction even if the character rotates afterward.
-    local direction = getDashVector(root, directionName)
-    local dashStartedAt = os.clock()
-    -- LinearVelocity is used because it provides controlled physics movement while
-    -- allowing the server to continuously change the velocity during the dash.
-    local velocity = Instance.new("LinearVelocity")
-    local attachment = Instance.new("Attachment")
-    attachment.Name = "DirectionalDashAttachment"
-    attachment.Parent = root
-    -- The attachment provides the physical reference point used by LinearVelocity.
-    velocity.Name = "DirectionalDashVelocity"
-    velocity.Attachment0 = attachment
-    -- World-relative movement ensures the calculated direction is not transformed
-    -- again by the attachment or character orientation.
-    velocity.RelativeTo = Enum.ActuatorRelativeTo.World
-    velocity.VectorVelocity = Vector3.zero
-    velocity.MaxForce = math.huge
-    -- This keeps the movement unconstrained by the default force limit behavior.
-    pcall(function()
-        velocity.ForceLimitsEnabled = false
-    end)
-    velocity.Parent = root
-    -- One state table groups every object and cleanup function belonging to this dash.
-    -- This makes the dash lifecycle easier to manage from death, removal, or timeout.
-    local state = {
-        token = token,
-        character = character,
-        humanoid = humanoid,
-        root = root,
-        attachment = attachment,
-        velocity = velocity,
-        restoreHumanoid = lockHumanoid(humanoid),
-        stopVisuals = beginVisualEffect(character, Config.DashDuration),
-    }
-    activeDashes[player] = state
-    -- A death connection prevents a dead character from retaining dash movement.
-    state.diedConnection = humanoid.Died:Connect(function()
-        finishDash(player, token)
-    end)
-    -- Character removal needs its own cleanup because the humanoid may not die first.
-    state.characterAncestryConnection = character.AncestryChanged:Connect(function(_, parent)
-        if not parent then
-            finishDash(player, token)
-        end
-    end)
-    -- Heartbeat allows the server to continuously calculate the required velocity
-    -- instead of applying one fixed impulse that would not match the configured curve.
-    state.movementConnection = RunService.Heartbeat:Connect(function()
-        if activeDashes[player] ~= state then
-            return
-        end
-        -- Progress converts elapsed time into a predictable 0-to-1 dash timeline.
-        local progress = math.clamp(
-            (os.clock() - dashStartedAt) / Config.DashDuration,
-            0,
-            1
-        )
-        if progress >= 1 then
-            finishDash(player, token)
-            return
-        end
-        -- This derivative creates acceleration at the start and deceleration at
-        -- the end, producing a smoother dash than using constant velocity.
-        local smoothStepDerivative = 6 * progress * (1 - progress)
-        -- Distance / duration establishes the required base speed, while the curve
-        -- controls how that speed is distributed across the dash's lifetime.
-        local speed = (Config.DashDistance / Config.DashDuration) * smoothStepDerivative
-        velocity.VectorVelocity = direction * speed
-    end)
-    -- Only after the server has accepted the request do clients receive the event.
-    -- This keeps animation synchronization tied to an actual server-approved dash.
-    dashStarted:FireAllClients(player, directionName, Config.DashDuration)
-    -- This provides a secondary cleanup path if the frame-based connection somehow
-    -- fails to finish the dash at exactly the configured duration.
-    task.delay(Config.DashDuration, function()
-        finishDash(player, token)
-    end)
-end
--- RemoteEvent data is validated before entering the main dash logic so unexpected
--- client data cannot be treated as a valid direction.
-dashRequest.OnServerEvent:Connect(function(player, directionName)
-    if typeof(directionName) ~= "string" then
-        return
-    end
-    startDash(player, directionName)
-end)
--- Player cleanup removes both active state and cooldown data when the player leaves.
-local function clearPlayer(player)
-    local state = activeDashes[player]
-    if state then
-        finishDash(player, state.token)
-    end
-    activeDashes[player] = nil
-    lastDashAt[player] = nil
-end
-Players.PlayerRemoving:Connect(clearPlayer)
--- Characters can be replaced without the player leaving, so their old dash state
--- must also be terminated when CharacterRemoving fires.
-Players.PlayerAdded:Connect(function(player)
-    player.CharacterRemoving:Connect(function(character)
-        local state = activeDashes[player]
-        if state and state.character == character then
-            finishDash(player, state.token)
-        end
-    end)
-end)
--- Existing players need the same CharacterRemoving connection when this script starts.
-for _, player in ipairs(Players:GetPlayers()) do
-    player.CharacterRemoving:Connect(function(character)
-        local state = activeDashes[player]
-        if state and state.character == character then
-            finishDash(player, state.token)
-        end
-    end)
-end
--- DirectionalDashClient
--- The client handles keyboard input and presentation while the server remains
--- authoritative over the actual dash movement and validation.
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local UserInputService = game:GetService("UserInputService")
 local RunService = game:GetService("RunService")
-local ContentProvider = game:GetService("ContentProvider")
-local player = Players.LocalPlayer
-local Config = require(ReplicatedStorage:WaitForChild("DirectionalDashConfig"))
-local remotes = ReplicatedStorage:WaitForChild("DirectionalDashRemotes")
-local dashRequest = remotes:WaitForChild("DashRequest")
-local dashStarted = remotes:WaitForChild("DashStarted")
--- These mappings translate physical keyboard input into the same direction names
--- used by the server and animation configuration.
-local directionByKey = {
-    [Enum.KeyCode.W] = "Front",
-    [Enum.KeyCode.S] = "Back",
-    [Enum.KeyCode.A] = "Left",
-    [Enum.KeyCode.D] = "Right",
+local TweenService = game:GetService("TweenService")
+local Debris = game:GetService("Debris")
+local Workspace = game:GetService("Workspace")
+
+--// PLAYER REFERENCES
+local Player = Players.LocalPlayer
+local Camera = Workspace.CurrentCamera
+
+--// CONFIGURATION
+local CONFIG = {
+	Dash = {
+		Distance = 22,
+		Duration = 0.18,
+		Cooldown = 0.65,
+		StaminaCost = 25,
+		MaxStamina = 100,
+		StaminaRecovery = 20,
+		Acceleration = 4,
+	},
+	Movement = {
+		MinimumDirection = 0.05,
+		WallPadding = 1.5,
+	},
+	Camera = {
+		DefaultFOV = 70,
+		DashFOV = 82,
+		TweenTime = 0.08,
+	},
+	Visuals = {
+		Transparency = 0.65,
+		AfterimageLifetime = 0.12,
+	},
+	Keys = {
+		Dash = Enum.KeyCode.Q,
+		Forward = Enum.KeyCode.W,
+		Backward = Enum.KeyCode.S,
+		Left = Enum.KeyCode.A,
+		Right = Enum.KeyCode.D,
+	},
 }
--- These tables allow the input system to remember multiple held directions
--- and determine which input should take priority when necessary.
-local heldDirections = {}
-local pressOrder = {}
-local activeCharacter = nil
-local localDashActive = false
-local localDashEndsAt = 0
-local movementLockConnection = nil
-local localDashToken = 0
-local localDashTrack = nil
-local localDashTrackConnection = nil
-local animationTracks = {}
--- Animation objects are created once instead of every dash to avoid repeatedly
--- allocating the same assets during gameplay.
-local animations = {}
-for directionName, animationId in pairs(Config.AnimationIds) do
-    local animation = Instance.new("Animation")
-    animation.Name = "DirectionalDash_" .. directionName
-    animation.AnimationId = animationId
-    animations[directionName] = animation
+
+--// DIRECTION TABLE
+local DIRECTIONS = {
+	Forward = Vector3.new(0, 0, -1),
+	Backward = Vector3.new(0, 0, 1),
+	Left = Vector3.new(-1, 0, 0),
+	Right = Vector3.new(1, 0, 0),
+}
+
+--// INPUT STATE
+local InputState = {
+	[CONFIG.Keys.Forward] = false,
+	[CONFIG.Keys.Backward] = false,
+	[CONFIG.Keys.Left] = false,
+	[CONFIG.Keys.Right] = false,
+}
+
+--// CONTROLLER METATABLE
+-- A metatable keeps the dash state and its behavior together instead of
+-- spreading state across unrelated global functions.
+local Controller = {}
+Controller.__index = Controller
+
+function Controller.new(player)
+	local self = setmetatable({}, Controller)
+
+	self.Player = player
+	self.Character = nil
+	self.Humanoid = nil
+	self.Root = nil
+	self.Animator = nil
+
+	self.IsDashing = false
+	self.LastDash = -math.huge
+	self.Stamina = CONFIG.Dash.MaxStamina
+
+	self.DashVelocity = nil
+	self.DashAttachment = nil
+	self.DashConnection = nil
+	self.DeathConnection = nil
+	self.CharacterConnection = nil
+
+	self.AnimationTracks = {}
+	self.VisualParts = {}
+
+	self.UI = nil
+	self.StaminaBar = nil
+	self.StatusLabel = nil
+
+	self.CameraTween = nil
+
+	return self
 end
--- Preloading reduces the chance of the first dash having visible animation delay.
-ContentProvider:PreloadAsync({
-    animations.Front,
-    animations.Back,
-    animations.Left,
-    animations.Right
-})
--- The local controller only needs these two character components to manage input
--- locking and reference the character currently performing the dash.
-local function getCharacterParts(character)
-    local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-    local root = character and character:FindFirstChild("HumanoidRootPart")
-    return humanoid, root
+
+--// CHARACTER SETUP
+function Controller:SetCharacter(character)
+	self:StopDash()
+	self:DisconnectCharacter()
+
+	self.Character = character
+	self.Humanoid = character:WaitForChild("Humanoid")
+	self.Root = character:WaitForChild("HumanoidRootPart")
+	self.Animator = self.Humanoid:FindFirstChildOfClass("Animator")
+
+	if not self.Animator then
+		self.Animator = Instance.new("Animator")
+		self.Animator.Parent = self.Humanoid
+	end
+
+	self.Stamina = CONFIG.Dash.MaxStamina
+	self:CreateAnimations()
+	self:CreateDeathConnection()
+	self:UpdateUI()
 end
--- Converts the current keyboard state into one direction that the server can validate.
-local function getHeldDirection()
-    local humanoid, root = getCharacterParts(player.Character)
-    local candidates = {}
-    -- Collect every direction currently being held instead of assuming only one key.
-    for directionName, isHeld in pairs(heldDirections) do
-        if isHeld then
-            candidates[#candidates + 1] = directionName
-        end
-    end
-    -- Forward is used as a safe default when the player presses Q without movement input.
-    if #candidates == 0 then
-        return "Front"
-    end
-    -- No comparison is required when only one direction is being held.
-    if #candidates == 1 then
-        return candidates[1]
-    end
-    -- For combinations such as W+D, the character's actual movement direction is
-    -- compared against each possible dash direction to choose the closest match.
-    local moveDirection = humanoid and humanoid.MoveDirection or Vector3.zero
-    if root and moveDirection.Magnitude > 0.05 then
-        local forward = Vector3.new(
-            root.CFrame.LookVector.X,
-            0,
-            root.CFrame.LookVector.Z
-        )
-        local right = Vector3.new(
-            root.CFrame.RightVector.X,
-            0,
-            root.CFrame.RightVector.Z
-        )
-        if forward.Magnitude > 0 then
-            forward = forward.Unit
-        end
-        if right.Magnitude > 0 then
-            right = right.Unit
-        end
-        -- These vectors use the same local-to-world relationship as the server,
-        -- ensuring the client chooses the same directional meaning that the server uses.
-        local worldDirection = {
-            Front = forward,
-            Back = -forward,
-            Left = -right,
-            Right = right,
-        }
-        local bestDirection = nil
-        local bestDot = -math.huge
-        -- Dot products provide a simple comparison between the player's movement
-        -- direction and each possible dash direction.
-        for _, directionName in ipairs(candidates) do
-            local dot = moveDirection.Unit:Dot(worldDirection[directionName])
-            if dot > bestDot then
-                bestDot = dot
-                bestDirection = directionName
-            end
-        end
-        if bestDirection then
-            return bestDirection
-        end
-    end
-    -- If movement direction cannot resolve the combination, the most recently
-    -- pressed key is used because it matches the player's latest input intention.
-    local newestDirection = candidates[1]
-    local newestOrder = pressOrder[newestDirection] or 0
-    for _, directionName in ipairs(candidates) do
-        local order = pressOrder[directionName] or 0
-        if order > newestOrder then
-            newestDirection = directionName
-            newestOrder = order
-        end
-    end
-    return newestDirection
+
+--// CHARACTER CLEANUP
+function Controller:DisconnectCharacter()
+	if self.DeathConnection then
+		self.DeathConnection:Disconnect()
+		self.DeathConnection = nil
+	end
 end
--- Only one dash animation should control a character at a time, so the previous
--- track is stopped before a new direction's animation is loaded.
-local function stopTrack(character)
-    local track = animationTracks[character]
-    animationTracks[character] = nil
-    if track then
-        pcall(function()
-            track:Stop(0.025)
-            track:Destroy()
-        end)
-    end
+
+--// DEATH HANDLING
+function Controller:CreateDeathConnection()
+	self.DeathConnection = self.Humanoid.Died:Connect(function()
+		self:StopDash()
+		self:ClearVisuals()
+	end)
 end
--- The client handles animation presentation because animation playback does not
--- need to be authoritative, while the server remains authoritative over movement.
-local function playDashAnimation(character, directionName, duration)
-    if not character or not character.Parent then
-        return nil
-    end
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not humanoid then
-        return nil
-    end
-    -- Animator is the Roblox component responsible for creating animation tracks
-    -- from Animation objects and is required before LoadAnimation can be used.
-    local animator = humanoid:FindFirstChildOfClass("Animator")
-    if not animator then
-        animator = Instance.new("Animator")
-        animator.Parent = humanoid
-    end
-    stopTrack(character)
-    -- The direction name received from the server selects the corresponding animation.
-    local animation = animations[directionName]
-    if not animation then
-        return nil
-    end
-    local track = animator:LoadAnimation(animation)
-    -- Action4 gives the dash animation high priority so normal movement animations
-    -- do not visually override the dash while it is active.
-    track.Priority = Enum.AnimationPriority.Action4
-    track.Looped = false
-    track:Play(0.02, 1, 1)
-    -- Scaling playback speed makes animations with different original lengths
-    -- finish at the same time as the server-controlled dash.
-    if track.Length > 0.001 then
-        track:AdjustSpeed(track.Length / duration)
-    end
-    animationTracks[character] = track
-    -- Delayed cleanup prevents unused animation tracks from remaining stored forever.
-    task.delay(duration, function()
-        if animationTracks[character] == track then
-            animationTracks[character] = nil
-            pcall(function()
-                track:Stop(0.03)
-                track:Destroy()
-            end)
-        end
-    end)
-    return track
+
+--// ANIMATION CREATION
+function Controller:CreateAnimations()
+	self.AnimationTracks = {}
+
+	local animations = {
+		Forward = "rbxassetid://",
+		Backward = "rbxassetid://",
+		Left = "rbxassetid://",
+		Right = "rbxassetid://", -- sorry didnt make any animations 
+	}
+
+	for name, id in pairs(animations) do
+		local animation = Instance.new("Animation")
+		animation.Name = "Dash_" .. name
+		animation.AnimationId = id
+
+		local success, track = pcall(function()
+			return self.Animator:LoadAnimation(animation)
+		end)
+
+		if success and track then
+			track.Priority = Enum.AnimationPriority.Action4
+			track.Looped = false
+			self.AnimationTracks[name] = track
+		end
+
+		animation:Destroy()
+	end
 end
--- Ends all local state associated with the current dash.
-local function endLocalDash(expectedToken)
-    -- An old callback is ignored when its token no longer matches the current dash.
-    if expectedToken and expectedToken ~= localDashToken then
-        return
-    end
-    if not localDashActive then
-        return
-    end
-    local track = localDashTrack
-    local character = activeCharacter
-    localDashActive = false
-    localDashToken += 1
-    localDashTrack = nil
-    -- Local connections are disconnected so they cannot continue locking the player
-    -- after the server has finished the dash.
-    if localDashTrackConnection then
-        localDashTrackConnection:Disconnect()
-        localDashTrackConnection = nil
-    end
-    if movementLockConnection then
-        movementLockConnection:Disconnect()
-        movementLockConnection = nil
-    end
-    if character and animationTracks[character] == track then
-        animationTracks[character] = nil
-    end
-    if track then
-        pcall(function()
-            track:Stop(0.03)
-            track:Destroy()
-        end)
-    end
+
+--// INPUT DIRECTION
+function Controller:GetInputDirection()
+	local x = 0
+	local z = 0
+
+	if InputState[CONFIG.Keys.Left] then
+		x -= 1
+	end
+
+	if InputState[CONFIG.Keys.Right] then
+		x += 1
+	end
+
+	if InputState[CONFIG.Keys.Forward] then
+		z -= 1
+	end
+
+	if InputState[CONFIG.Keys.Backward] then
+		z += 1
+	end
+
+	local input = Vector3.new(x, 0, z)
+
+	if input.Magnitude < CONFIG.Movement.MinimumDirection then
+		return Vector3.new(0, 0, -1)
+	end
+
+	return input.Unit
 end
--- This handles the local presentation of a confirmed server dash.
--- It does not move the player; it only prevents input from fighting server movement.
-local function beginLocalDash(character, duration, track)
-    if localDashActive then
-        endLocalDash()
-    end
-    localDashToken += 1
-    local token = localDashToken
-    localDashActive = true
-    activeCharacter = character
-    localDashEndsAt = os.clock() + duration
-    localDashTrack = track
-    -- If the animation ends unexpectedly, the local dash state is cleaned up as well.
-    if track then
-        localDashTrackConnection = track.Stopped:Connect(function()
-            if localDashActive and localDashToken == token then
-                endLocalDash(token)
-            end
-        end)
-    end
-    -- RenderStepped is used for local input locking because it runs on the client
-    -- every rendered frame and prevents movement input from visually fighting the dash.
-    movementLockConnection = RunService.RenderStepped:Connect(function()
-        if localDashToken ~= token then
-            return
-        end
-        if os.clock() >= localDashEndsAt or player.Character ~= activeCharacter then
-            endLocalDash(token)
-            return
-        end
-        local humanoid = activeCharacter and activeCharacter:FindFirstChildOfClass("Humanoid")
-        if not humanoid or humanoid.Health <= 0 then
-            endLocalDash(token)
-            return
-        end
-        humanoid.Jump = false
-        humanoid:Move(Vector3.zero, false)
-    end)
+
+--// CAMERA RELATIVE DIRECTION
+function Controller:GetWorldDirection()
+	local localDirection = self:GetInputDirection()
+
+	local cameraCFrame = Camera.CFrame
+
+	local forward = Vector3.new(
+		cameraCFrame.LookVector.X,
+		0,
+		cameraCFrame.LookVector.Z
+	)
+
+	local right = Vector3.new(
+		cameraCFrame.RightVector.X,
+		0,
+		cameraCFrame.RightVector.Z
+	)
+
+	if forward.Magnitude <= 0 then
+		forward = Vector3.new(0, 0, -1)
+	else
+		forward = forward.Unit
+	end
+
+	if right.Magnitude <= 0 then
+		right = Vector3.new(1, 0, 0)
+	else
+		right = right.Unit
+	end
+
+	local worldDirection =
+		right * localDirection.X
+		+ forward * -localDirection.Z
+
+	if worldDirection.Magnitude <= 0 then
+		return forward
+	end
+
+	return worldDirection.Unit
 end
--- The client sends only the player's intended direction.
--- Actual permission and movement are still decided by the server.
-local function requestDash()
-    if localDashActive then
-        return
-    end
-    if player.Character and player.Character.Parent then
-        dashRequest:FireServer(getHeldDirection())
-    end
+
+--// DIRECTION NAME
+function Controller:GetDirectionName(direction)
+	local root = self.Root
+
+	if not root then
+		return "Forward"
+	end
+
+	local forward = Vector3.new(
+		root.CFrame.LookVector.X,
+		0,
+		root.CFrame.LookVector.Z
+	).Unit
+
+	local right = Vector3.new(
+		root.CFrame.RightVector.X,
+		0,
+		root.CFrame.RightVector.Z
+	).Unit
+
+	local values = {
+		Forward = direction:Dot(forward),
+		Backward = direction:Dot(-forward),
+		Right = direction:Dot(right),
+		Left = direction:Dot(-right),
+	}
+
+	local selected = "Forward"
+	local highest = -math.huge
+
+	for name, value in pairs(values) do
+		if value > highest then
+			highest = value
+			selected = name
+		end
+	end
+
+	return selected
 end
--- Convert keyboard input into held direction state or a dash request.
-UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    -- Ignoring processed input prevents the dash system from reacting to input
-    -- that Roblox has already consumed for another interface.
-    if gameProcessed or input.UserInputType ~= Enum.UserInputType.Keyboard then
-        return
-    end
-    local directionName = directionByKey[input.KeyCode]
-    if directionName then
-        -- Store the key so combinations can be resolved later.
-        heldDirections[directionName] = true
-        -- The timestamp provides ordering information for simultaneous held keys.
-        pressOrder[directionName] = os.clock()
-    elseif input.KeyCode == Enum.KeyCode.Q then
-        requestDash()
-    end
+
+--// RAYCAST PARAMETERS
+function Controller:GetRaycastParams()
+	local params = RaycastParams.new()
+
+	params.FilterType = Enum.RaycastFilterType.Exclude
+	params.FilterDescendantsInstances = {self.Character}
+	params.IgnoreWater = true
+
+	return params
+end
+
+--// OBSTACLE CHECK
+function Controller:GetSafeDistance(direction)
+	if not self.Root then
+		return 0
+	end
+
+	local origin = self.Root.Position
+	local castDistance = CONFIG.Dash.Distance
+
+	local result = Workspace:Raycast(
+		origin,
+		direction * castDistance,
+		self:GetRaycastParams()
+	)
+
+	if not result then
+		return castDistance
+	end
+
+	local distance = (result.Position - origin).Magnitude
+	local safeDistance = math.max(
+		distance - CONFIG.Movement.WallPadding,
+		0
+	)
+
+	return safeDistance
+end
+
+--// STAMINA CHECK
+function Controller:CanDash()
+	if not self.Character then
+		return false
+	end
+
+	if not self.Humanoid then
+		return false
+	end
+
+	if self.Humanoid.Health <= 0 then
+		return false
+	end
+
+	if self.IsDashing then
+		return false
+	end
+
+	if os.clock() - self.LastDash < CONFIG.Dash.Cooldown then
+		return false
+	end
+
+	if self.Stamina < CONFIG.Dash.StaminaCost then
+		return false
+	end
+
+	return true
+end
+
+--// ANIMATION
+function Controller:PlayAnimation(directionName)
+	local track = self.AnimationTracks[directionName]
+
+	if not track then
+		return
+	end
+
+	for _, otherTrack in pairs(self.AnimationTracks) do
+		if otherTrack ~= track and otherTrack.IsPlaying then
+			otherTrack:Stop(0.04)
+		end
+	end
+
+	track:Play(0.04, 1, 1)
+
+	if track.Length > 0 then
+		track:AdjustSpeed(track.Length / CONFIG.Dash.Duration)
+	end
+end
+
+--// CAMERA EFFECT
+function Controller:SetCameraDashEffect(enabled)
+	local targetFOV = enabled
+		and CONFIG.Camera.DashFOV
+		or CONFIG.Camera.DefaultFOV
+
+	if self.CameraTween then
+		self.CameraTween:Cancel()
+	end
+
+	self.CameraTween = TweenService:Create(
+		Camera,
+		TweenInfo.new(
+			CONFIG.Camera.TweenTime,
+			Enum.EasingStyle.Quad,
+			Enum.EasingDirection.Out
+		),
+		{
+			FieldOfView = targetFOV,
+		}
+	)
+
+	self.CameraTween:Play()
+end
+
+--// AFTERIMAGE CREATION
+function Controller:CreateAfterimage()
+	if not self.Character then
+		return
+	end
+
+	local folder = Workspace:FindFirstChild("DashAfterimages")
+
+	if not folder then
+		folder = Instance.new("Folder")
+		folder.Name = "DashAfterimages"
+		folder.Parent = Workspace
+	end
+
+	for _, original in ipairs(self.Character:GetChildren()) do
+		if original:IsA("BasePart")
+			and original.Name ~= "HumanoidRootPart" then
+
+			local clone = original:Clone()
+
+			for _, descendant in ipairs(clone:GetDescendants()) do
+				if descendant:IsA("Script")
+					or descendant:IsA("LocalScript")
+					or descendant:IsA("ModuleScript") then
+					descendant:Destroy()
+				end
+			end
+
+			clone.Anchored = true
+			clone.CanCollide = false
+			clone.CanTouch = false
+			clone.CanQuery = false
+			clone.Transparency = CONFIG.Visuals.Transparency
+			clone.Parent = folder
+
+			Debris:AddItem(
+				clone,
+				CONFIG.Visuals.AfterimageLifetime
+			)
+
+			local tween = TweenService:Create(
+				clone,
+				TweenInfo.new(
+					CONFIG.Visuals.AfterimageLifetime,
+					Enum.EasingStyle.Linear
+				),
+				{
+					Transparency = 1,
+				}
+			)
+
+			tween:Play()
+		end
+	end
+end
+
+--// VELOCITY CREATION
+function Controller:CreateDashPhysics()
+	self.DashAttachment = Instance.new("Attachment")
+	self.DashAttachment.Name = "DashAttachment"
+	self.DashAttachment.Parent = self.Root
+
+	self.DashVelocity = Instance.new("LinearVelocity")
+	self.DashVelocity.Name = "DashVelocity"
+	self.DashVelocity.Attachment0 = self.DashAttachment
+	self.DashVelocity.RelativeTo = Enum.ActuatorRelativeTo.World
+	self.DashVelocity.MaxForce = math.huge
+	self.DashVelocity.VectorVelocity = Vector3.zero
+
+	pcall(function()
+		self.DashVelocity.ForceLimitsEnabled = false
+	end)
+
+	self.DashVelocity.Parent = self.Root
+end
+
+--// PHYSICS CLEANUP
+function Controller:DestroyDashPhysics()
+	if self.DashVelocity then
+		self.DashVelocity:Destroy()
+		self.DashVelocity = nil
+	end
+
+	if self.DashAttachment then
+		self.DashAttachment:Destroy()
+		self.DashAttachment = nil
+	end
+end
+
+--// MOVEMENT LOCK
+function Controller:LockHumanoid()
+	if not self.Humanoid then
+		return
+	end
+
+	self.Humanoid.AutoRotate = false
+	self.Humanoid.WalkSpeed = 0
+	self.Humanoid.Jump = false
+end
+
+--// MOVEMENT RESTORE
+function Controller:RestoreHumanoid()
+	if not self.Humanoid then
+		return
+	end
+
+	self.Humanoid.AutoRotate = true
+	self.Humanoid.WalkSpeed = 16
+	self.Humanoid.Jump = false
+end
+
+--// DASH START
+function Controller:Dash()
+	if not self:CanDash() then
+		return
+	end
+
+	local direction = self:GetWorldDirection()
+	local directionName = self:GetDirectionName(direction)
+	local safeDistance = self:GetSafeDistance(direction)
+
+	if safeDistance <= 0 then
+		return
+	end
+
+	self.IsDashing = true
+	self.LastDash = os.clock()
+	self.Stamina -= CONFIG.Dash.StaminaCost
+
+	self:LockHumanoid()
+	self:CreateDashPhysics()
+	self:PlayAnimation(directionName)
+	self:SetCameraDashEffect(true)
+	self:CreateAfterimage()
+
+	local startTime = os.clock()
+	local duration = CONFIG.Dash.Duration
+
+	self.DashConnection = RunService.RenderStepped:Connect(function()
+		if not self.IsDashing then
+			return
+		end
+
+		if not self.Root or not self.Root.Parent then
+			self:StopDash()
+			return
+		end
+
+		local elapsed = os.clock() - startTime
+		local progress = math.clamp(
+			elapsed / duration,
+			0,
+			1
+		)
+
+		if progress >= 1 then
+			self:StopDash()
+			return
+		end
+
+		local acceleration =
+			math.sin(progress * math.pi)
+
+		local speed =
+			(safeDistance / duration)
+			* acceleration
+			* CONFIG.Dash.Acceleration
+
+		local currentVelocity =
+			direction * speed
+
+		if self.DashVelocity then
+			self.DashVelocity.VectorVelocity =
+				currentVelocity
+		end
+
+		if progress > 0.35
+			and progress < 0.75
+			and math.random() < 0.15 then
+			self:CreateAfterimage()
+		end
+
+		self.Humanoid.Jump = false
+	end)
+end
+
+--// DASH STOP
+function Controller:StopDash()
+	if not self.IsDashing and not self.DashConnection then
+		return
+	end
+
+	self.IsDashing = false
+
+	if self.DashConnection then
+		self.DashConnection:Disconnect()
+		self.DashConnection = nil
+	end
+
+	self:DestroyDashPhysics()
+	self:RestoreHumanoid()
+	self:SetCameraDashEffect(false)
+end
+
+--// STAMINA UPDATE
+function Controller:RecoverStamina(deltaTime)
+	if self.IsDashing then
+		return
+	end
+
+	self.Stamina = math.min(
+		CONFIG.Dash.MaxStamina,
+		self.Stamina
+			+ CONFIG.Dash.StaminaRecovery
+			* deltaTime
+	)
+end
+
+--// UI CREATION
+function Controller:CreateUI()
+	local gui = Instance.new("ScreenGui")
+	gui.Name = "DashDemoUI"
+	gui.ResetOnSpawn = false
+	gui.IgnoreGuiInset = true
+	gui.Parent = Player:WaitForChild("PlayerGui")
+
+	local frame = Instance.new("Frame")
+	frame.Name = "Container"
+	frame.Size = UDim2.fromOffset(280, 90)
+	frame.Position = UDim2.new(
+		0,
+		20,
+		1,
+		-110
+	)
+	frame.BackgroundTransparency = 0.15
+	frame.Parent = gui
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = frame
+
+	local status = Instance.new("TextLabel")
+	status.Name = "Status"
+	status.Size = UDim2.new(1, -20, 0, 30)
+	status.Position = UDim2.fromOffset(10, 8)
+	status.BackgroundTransparency = 1
+	status.Text = "DASH READY | Q"
+	status.TextSize = 18
+	status.Font = Enum.Font.GothamBold
+	status.TextXAlignment = Enum.TextXAlignment.Left
+	status.Parent = frame
+
+	local barBackground = Instance.new("Frame")
+	barBackground.Name = "StaminaBackground"
+	barBackground.Size = UDim2.new(1, -20, 0, 16)
+	barBackground.Position = UDim2.fromOffset(10, 50)
+	barBackground.BackgroundTransparency = 0.25
+	barBackground.Parent = frame
+
+	local barCorner = Instance.new("UICorner")
+	barCorner.CornerRadius = UDim.new(1, 0)
+	barCorner.Parent = barBackground
+
+	local bar = Instance.new("Frame")
+	bar.Name = "Stamina"
+	bar.Size = UDim2.fromScale(1, 1)
+	bar.BackgroundTransparency = 0
+	bar.Parent = barBackground
+
+	local barFillCorner = Instance.new("UICorner")
+	barFillCorner.CornerRadius = UDim.new(1, 0)
+	barFillCorner.Parent = bar
+
+	self.UI = gui
+	self.StatusLabel = status
+	self.StaminaBar = bar
+end
+
+--// UI UPDATE
+function Controller:UpdateUI()
+	if not self.StatusLabel or not self.StaminaBar then
+		return
+	end
+
+	local percentage =
+		self.Stamina / CONFIG.Dash.MaxStamina
+
+	self.StaminaBar.Size =
+		UDim2.fromScale(
+			math.clamp(percentage, 0, 1),
+			1
+		)
+
+	if self.IsDashing then
+		self.StatusLabel.Text = "DASHING"
+	elseif percentage < 1 then
+		self.StatusLabel.Text =
+			"DASH COOLDOWN / STAMINA"
+	else
+		self.StatusLabel.Text =
+			"DASH READY | Q"
+	end
+end
+
+--// VISUAL CLEANUP
+function Controller:ClearVisuals()
+	for _, object in ipairs(self.VisualParts) do
+		if object and object.Parent then
+			object:Destroy()
+		end
+	end
+
+	table.clear(self.VisualParts)
+end
+
+--// UPDATE LOOP
+function Controller:Update(deltaTime)
+	self:RecoverStamina(deltaTime)
+
+	if self.LastDash ~= -math.huge then
+		if os.clock() - self.LastDash >= CONFIG.Dash.Cooldown
+			and self.Stamina >= CONFIG.Dash.StaminaCost then
+
+			self:UpdateUI()
+		end
+	end
+
+	self:UpdateUI()
+end
+
+--// CONTROLLER INITIALIZATION
+local DashController = Controller.new(Player)
+
+DashController:CreateUI()
+
+--// INITIAL CHARACTER
+if Player.Character then
+	DashController:SetCharacter(Player.Character)
+end
+
+--// CHARACTER RESPAWN
+Player.CharacterAdded:Connect(function(character)
+	DashController:SetCharacter(character)
 end)
--- Remove the direction from the active input state once the key is released.
+
+--// KEYBOARD INPUT
+UserInputService.InputBegan:Connect(function(input, processed)
+	if processed then
+		return
+	end
+
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	if InputState[input.KeyCode] ~= nil then
+		InputState[input.KeyCode] = true
+		return
+	end
+
+	if input.KeyCode == CONFIG.Keys.Dash then
+		DashController:Dash()
+	end
+end)
+
+--// KEYBOARD RELEASE
 UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType ~= Enum.UserInputType.Keyboard then
-        return
-    end
-    local directionName = directionByKey[input.KeyCode]
-    if directionName then
-        heldDirections[directionName] = nil
-    end
+	if input.UserInputType ~= Enum.UserInputType.Keyboard then
+		return
+	end
+
+	if InputState[input.KeyCode] ~= nil then
+		InputState[input.KeyCode] = false
+	end
 end)
--- This event is received only after the server accepts a dash.
--- It synchronizes the visual animation across every client while keeping movement server-sided.
-dashStarted.OnClientEvent:Connect(function(dashingPlayer, directionName, duration)
-    -- Validate the replicated player reference before using it as a character owner.
-    if typeof(dashingPlayer) ~= "Instance" or not dashingPlayer:IsA("Player") then
-        return
-    end
-    -- The direction must exist in the shared animation configuration so clients
-    -- cannot attempt to load an undefined animation.
-    if typeof(directionName) ~= "string" or not Config.AnimationIds[directionName] then
-        return
-    end
-    local character = dashingPlayer.Character
-    if not character then
-        return
-    end
-    -- The server-provided duration is preferred because it represents the dash
-    -- that was actually accepted rather than a potentially different local value.
-    local dashDuration = duration or Config.DashDuration
-    local track = playDashAnimation(character, directionName, dashDuration)
-    -- Only the local player needs input locking; other clients only need the animation.
-    if dashingPlayer == player then
-        beginLocalDash(character, dashDuration, track)
-    end
+
+--// FRAME UPDATE
+RunService.RenderStepped:Connect(function(deltaTime)
+	DashController:Update(deltaTime)
 end)
--- A new character invalidates the previous local dash state because the old
--- humanoid and animation objects no longer belong to the active character.
-player.CharacterAdded:Connect(function(character)
-    endLocalDash()
-    activeCharacter = character
-end)
--- CharacterRemoving is the final local cleanup path for animations and dash state
--- when Roblox replaces or removes the player's character.
-player.CharacterRemoving:Connect(function(character)
-    if activeCharacter == character then
-        endLocalDash()
-    end
-    stopTrack(character)
-end)
+
+--// CAMERA RECOVERY
+Camera.FieldOfView = CONFIG.Camera.DefaultFOV
