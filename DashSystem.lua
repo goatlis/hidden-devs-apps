@@ -1,5 +1,3 @@
--- Discord: g1atlis | Roblox: Skibidi_goatlis
-
 --// SERVICES
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
