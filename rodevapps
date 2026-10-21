@@ -1,1 +1,323 @@
+-- this script was made in Visual studio code
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Lighting = game:GetService("Lighting")
+local TweenService = game:GetService("TweenService")
 
+local player = Players.LocalPlayer
+local playerGui = player:WaitForChild("PlayerGui")
+local remoteEvent = ReplicatedStorage:WaitForChild("FallingStarsEvent")
+
+local FALL_HEIGHT = 300
+local FALL_SPREAD = 400
+local STAR_INTERVAL = 0.15
+local STAR_LIFETIME = 4
+
+local originalLighting = {
+    ClockTime = Lighting.ClockTime,
+    Brightness = Lighting.Brightness,
+    Ambient = Lighting.Ambient,
+    OutdoorAmbient = Lighting.OutdoorAmbient,
+    FogColor = Lighting.FogColor,
+    ExposureCompensation = Lighting.ExposureCompensation,
+}
+
+local originalSky = Lighting:FindFirstChildOfClass("Sky")
+local originalSkyProps = {}
+if originalSky then
+    originalSkyProps.SunAngularSize = originalSky.SunAngularSize
+    originalSkyProps.MoonAngularSize = originalSky.MoonAngularSize
+    originalSkyProps.StarCount = originalSky.StarCount
+    originalSkyProps.SkyboxBk = originalSky.SkyboxBk
+    originalSkyProps.SkyboxDn = originalSky.SkyboxDn
+    originalSkyProps.SkyboxFt = originalSky.SkyboxFt
+    originalSkyProps.SkyboxLf = originalSky.SkyboxLf
+    originalSkyProps.SkyboxRt = originalSky.SkyboxRt
+    originalSkyProps.SkyboxUp = originalSky.SkyboxUp
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "FallingStarsGui"
+screenGui.ResetOnSpawn = false
+screenGui.IgnoreGuiInset = true
+screenGui.Parent = playerGui
+
+local timerLabel = Instance.new("TextLabel")
+timerLabel.Name = "TimerLabel"
+timerLabel.Size = UDim2.new(0, 120, 0, 35)
+timerLabel.Position = UDim2.new(1, -135, 1, -50)
+timerLabel.BackgroundTransparency = 1
+timerLabel.BorderSizePixel = 0
+timerLabel.Text = ""
+timerLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+timerLabel.TextScaled = true
+timerLabel.Font = Enum.Font.GothamBold
+timerLabel.Visible = false
+timerLabel.Parent = screenGui
+
+local announcement = Instance.new("TextLabel")
+announcement.Name = "Announcement"
+announcement.Size = UDim2.new(0, 500, 0, 60)
+announcement.Position = UDim2.new(0.5, -250, 0, 20)
+announcement.BackgroundTransparency = 1
+announcement.Text = ""
+announcement.TextColor3 = Color3.fromRGB(255, 255, 255)
+announcement.TextScaled = true
+announcement.Font = Enum.Font.GothamBold
+announcement.Visible = false
+announcement.Parent = screenGui
+
+local function applyStarryNight()
+    local tweenInfo = TweenInfo.new(4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+    TweenService:Create(Lighting, tweenInfo, {
+        ClockTime = 0,
+        Brightness = 0.2,
+        Ambient = Color3.fromRGB(20, 25, 50),
+        OutdoorAmbient = Color3.fromRGB(15, 20, 45),
+        FogColor = Color3.fromRGB(5, 5, 20),
+        ExposureCompensation = -0.3,
+    }):Play()
+
+    local sky = Lighting:FindFirstChildOfClass("Sky")
+    if not sky then
+        sky = Instance.new("Sky")
+        sky.Parent = Lighting
+    end
+
+    sky.StarCount = 5000
+    sky.SunAngularSize = 0
+    sky.MoonAngularSize = 0
+    sky.CelestialBodiesShown = true
+    sky.SkyboxBk = "rbxassetid://159454299"
+    sky.SkyboxDn = "rbxassetid://159454296"
+    sky.SkyboxFt = "rbxassetid://159454293"
+    sky.SkyboxLf = "rbxassetid://159454287"
+    sky.SkyboxRt = "rbxassetid://159454300"
+    sky.SkyboxUp = "rbxassetid://159454304"
+end
+
+local function restoreSky()
+    local tweenInfo = TweenInfo.new(4, Enum.EasingStyle.Sine, Enum.EasingDirection.InOut)
+    TweenService:Create(Lighting, tweenInfo, {
+        ClockTime = originalLighting.ClockTime,
+        Brightness = originalLighting.Brightness,
+        Ambient = originalLighting.Ambient,
+        OutdoorAmbient = originalLighting.OutdoorAmbient,
+        FogColor = originalLighting.FogColor,
+        ExposureCompensation = originalLighting.ExposureCompensation,
+    }):Play()
+
+    if originalSky then
+        local sky = Lighting:FindFirstChildOfClass("Sky")
+        if sky and originalSkyProps.SunAngularSize then
+            sky.SunAngularSize = originalSkyProps.SunAngularSize
+            sky.MoonAngularSize = originalSkyProps.MoonAngularSize
+            sky.StarCount = originalSkyProps.StarCount or 3000
+        end
+        if originalSkyProps.SkyboxBk then
+            sky.SkyboxBk = originalSkyProps.SkyboxBk
+            sky.SkyboxDn = originalSkyProps.SkyboxDn
+            sky.SkyboxFt = originalSkyProps.SkyboxFt
+            sky.SkyboxLf = originalSkyProps.SkyboxLf
+            sky.SkyboxRt = originalSkyProps.SkyboxRt
+            sky.SkyboxUp = originalSkyProps.SkyboxUp
+        end
+    end
+end
+
+local spawnThread
+local updateThread
+local activeStars = {}
+
+local function createFallingStar()
+    local camera = workspace.CurrentCamera
+    if not camera then return end
+
+    local template = ReplicatedStorage:FindFirstChild("FallingStarTemplate")
+    if not template then return end
+
+    local camPos = camera.CFrame.Position
+    local angle = math.random() * math.pi * 2
+    local dist = math.random() * FALL_SPREAD
+    local startPos = Vector3.new(
+        camPos.X + math.cos(angle) * dist,
+        camPos.Y + FALL_HEIGHT + math.random(-50, 50),
+        camPos.Z + math.sin(angle) * dist
+    )
+
+    local endPos = Vector3.new(
+        startPos.X + math.random(-100, 100),
+        camPos.Y - 50,
+        startPos.Z + math.random(-100, 100)
+    )
+
+    local star = template:Clone()
+    star.Anchored = true
+    star.CanCollide = false
+    star.CanQuery = false
+    star.CanTouch = false
+    star.Transparency = 0
+    star.CFrame = CFrame.new(startPos, endPos)
+    star.Parent = workspace
+
+    for _, child in ipairs(star:GetDescendants()) do
+        if child:IsA("ParticleEmitter") then
+            child.Enabled = true
+        elseif child:IsA("Trail") then
+            child.Enabled = true
+        elseif child:IsA("Attachment") then
+            child.Visible = true
+        end
+    end
+
+    local light = Instance.new("PointLight")
+    light.Color = star.Color
+    light.Brightness = 8
+    light.Range = 25
+    light.Parent = star
+
+    table.insert(activeStars, {
+        part = star,
+        startPos = startPos,
+        endPos = endPos,
+        startTime = os.clock(),
+        lifetime = STAR_LIFETIME,
+        light = light,
+    })
+end
+
+local function startStarSpawning()
+    if spawnThread then task.cancel(spawnThread) end
+    if updateThread then task.cancel(updateThread) end
+
+    spawnThread = task.spawn(function()
+        while true do
+            createFallingStar()
+            task.wait(STAR_INTERVAL + math.random() * 0.1)
+        end
+    end)
+
+    updateThread = task.spawn(function()
+        while true do
+            local now = os.clock()
+            for i = #activeStars, 1, -1 do
+                local data = activeStars[i]
+                local progress = (now - data.startTime) / data.lifetime
+
+                if progress >= 1 then
+                    data.part.Transparency = 1
+                    if data.light then data.light.Enabled = false end
+                    for _, child in ipairs(data.part:GetDescendants()) do
+                        if child:IsA("ParticleEmitter") then
+                            child.Enabled = false
+                        end
+                    end
+                    data.part:Destroy()
+                    table.remove(activeStars, i)
+                else
+                    local easedT = progress * progress
+                    local pos = data.startPos:Lerp(data.endPos, easedT)
+                    data.part.CFrame = CFrame.new(pos, data.endPos)
+
+                    if progress > 0.8 then
+                        data.part.Transparency = (progress - 0.8) / 0.2
+                        if data.light then
+                            data.light.Brightness = 8 * (1 - (progress - 0.8) / 0.2)
+                        end
+                    end
+
+                    for _, child in ipairs(data.part:GetDescendants()) do
+                        if child:IsA("ParticleEmitter") then
+                            child.Speed = NumberRange.new(2 + progress * 10, 5 + progress * 15)
+                        end
+                    end
+                end
+            end
+            task.wait(0.03)
+        end
+    end)
+end
+
+local function stopStarSpawning()
+    if spawnThread then task.cancel(spawnThread); spawnThread = nil end
+    if updateThread then task.cancel(updateThread); updateThread = nil end
+
+    task.spawn(function()
+        for _, data in ipairs(activeStars) do
+            if data.part and data.part.Parent then
+                data.part.Transparency = 1
+                if data.light then data.light.Enabled = false end
+                for _, child in ipairs(data.part:GetDescendants()) do
+                    if child:IsA("ParticleEmitter") then
+                        child.Enabled = false
+                    end
+                end
+                task.wait(0.1)
+                data.part:Destroy()
+            end
+        end
+        activeStars = {}
+    end)
+end
+
+local timerThread
+
+local function startTimer(endTime)
+    if timerThread then task.cancel(timerThread) end
+    timerLabel.Visible = true
+
+    timerThread = task.spawn(function()
+        while true do
+            local remaining = endTime - os.time()
+            if remaining <= 0 then
+                timerLabel.Text = "0:00"
+                task.wait(2)
+                timerLabel.Visible = false
+                break
+            end
+            timerLabel.Text = string.format("%d:%02d", math.floor(remaining / 60), remaining % 60)
+            task.wait(0.5)
+        end
+    end)
+end
+
+local function stopTimer()
+    if timerThread then task.cancel(timerThread); timerThread = nil end
+    timerLabel.Visible = false
+    timerLabel.Text = ""
+end
+
+local function showAnnouncement(username)
+    announcement.Text = string.format("%s has started Falling Stars Event! Enjoy", username)
+    announcement.Visible = true
+    announcement.TextTransparency = 1
+
+    local tweenInfo = TweenInfo.new(0.5, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+    TweenService:Create(announcement, tweenInfo, {
+        TextTransparency = 0,
+    }):Play()
+
+    task.wait(6)
+
+    TweenService:Create(announcement, tweenInfo, {
+        TextTransparency = 1,
+    }):Play()
+
+    task.wait(0.5)
+    announcement.Visible = false
+end
+
+remoteEvent.OnClientEvent:Connect(function(action, username, endTime)
+    if action == "Start" then
+        applyStarryNight()
+        if username and username ~= "" then
+            task.spawn(showAnnouncement, username)
+        end
+        if endTime then startTimer(endTime) end
+        startStarSpawning()
+    elseif action == "Stop" then
+        restoreSky()
+        stopTimer()
+        stopStarSpawning()
+    end
+end)
