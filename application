@@ -1,0 +1,1222 @@
+local Debris = game:GetService("Debris")
+local Lighting = game:GetService("Lighting")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local TweenService = game:GetService("TweenService")
+local Workspace = game:GetService("Workspace")
+
+local IsagiEffectRuntime = {}
+IsagiEffectRuntime.__index = IsagiEffectRuntime
+
+local TRAIL_LIMB_CANDIDATES = {
+	RightLeg = { "RightLowerLeg", "Right Leg", "RightFoot", "RightUpperLeg" },
+	LeftLeg = { "LeftLowerLeg", "Left Leg", "LeftFoot", "LeftUpperLeg" },
+	RightArm = { "RightLowerArm", "Right Arm", "RightHand", "RightUpperArm" },
+	LeftArm = { "LeftLowerArm", "Left Arm", "LeftHand", "LeftUpperArm" },
+}
+
+local function configureTrailCarrier(root)
+	if not root then
+		return
+	end
+
+	local function configurePart(part)
+		part.Anchored = false
+		part.CanCollide = false
+		part.CanTouch = false
+		part.CanQuery = false
+		part.Massless = true
+		part.CastShadow = false
+	end
+
+	if root:IsA("BasePart") then
+		configurePart(root)
+	end
+	for _, object in ipairs(root:GetDescendants()) do
+		if object:IsA("BasePart") then
+			configurePart(object)
+		elseif object:IsA("ParticleEmitter") then
+			object.LockedToPart = true
+		end
+	end
+end
+
+local function captureAndDisableTrailVisuals(root)
+	local states = {}
+	if not root then
+		return states
+	end
+
+	for _, object in ipairs(root:GetDescendants()) do
+		if object:IsA("Trail")
+			or object:IsA("Beam")
+			or object:IsA("ParticleEmitter")
+			or object:IsA("PointLight")
+			or object:IsA("SpotLight")
+			or object:IsA("SurfaceLight")
+		then
+			table.insert(states, {
+				Object = object,
+				Enabled = object.Enabled,
+			})
+			object.Enabled = false
+		end
+	end
+	return states
+end
+
+local function restoreTrailVisuals(states)
+	for _, state in ipairs(states or {}) do
+		local object = state.Object
+		if object and object.Parent then
+			object.Enabled = state.Enabled == true
+		end
+	end
+end
+
+local function getParticleLifetime(root)
+	local maximum = 0
+	if not root then
+		return maximum
+	end
+	for _, object in ipairs(root:GetDescendants()) do
+		if object:IsA("ParticleEmitter") then
+			maximum = math.max(maximum, object.Lifetime.Max)
+		end
+	end
+	return maximum
+end
+
+local function resolveMeshEasingStyle(value)
+	if typeof(value) == "EnumItem" and value.EnumType == Enum.EasingStyle then
+		return value
+	end
+	if type(value) == "string" then
+		local ok, result = pcall(function()
+			return Enum.EasingStyle[value]
+		end)
+		if ok and result then
+			return result
+		end
+	end
+	return Enum.EasingStyle.Quart
+end
+
+local function resolveMeshEasingDirection(value)
+	if typeof(value) == "EnumItem" and value.EnumType == Enum.EasingDirection then
+		return value
+	end
+	if type(value) == "string" then
+		local ok, result = pcall(function()
+			return Enum.EasingDirection[value]
+		end)
+		if ok and result then
+			return result
+		end
+	end
+	return Enum.EasingDirection.Out
+end
+
+
+local function faceFrameLaterallyForward(sourceFrame, forwardDirection)
+	if typeof(sourceFrame) ~= "CFrame" or typeof(forwardDirection) ~= "Vector3" then
+		return sourceFrame
+	end
+
+	local forward = Vector3.new(forwardDirection.X, 0, forwardDirection.Z)
+	if forward.Magnitude < 0.001 then
+		return sourceFrame
+	end
+	forward = forward.Unit
+
+
+	local right = -forward
+	local up = Vector3.yAxis
+	local back = right:Cross(up)
+	if back.Magnitude < 0.001 then
+		return sourceFrame
+	end
+	back = back.Unit
+	up = back:Cross(right).Unit
+
+	return CFrame.fromMatrix(sourceFrame.Position, right, up, back)
+end
+
+
+
+function IsagiEffectRuntime.new(options)
+	options = type(options) == "table" and options or {}
+	return setmetatable({
+		LocalPlayer = options.LocalPlayer,
+		Parent = typeof(options.Parent) == "Instance" and options.Parent or Workspace,
+		PlayedImpacts = {},
+		ActiveImpactRoots = {},
+		ActiveDirectShotChargeTrails = {},
+		ActiveOffBallTrails = {},
+		WarnedMissingTemplates = {},
+		Destroyed = false,
+
+		FovToken = 0,
+		FovTween = nil,
+		FovReturnTween = nil,
+		FovCamera = nil,
+		FovRestore = nil,
+
+		ColorToken = 0,
+		ColorTween = nil,
+		ColorEffect = nil,
+
+		BlurToken = 0,
+		BlurTween = nil,
+		BlurEffect = nil,
+		BlurBaselineSize = nil,
+		BlurBaselineEnabled = nil,
+		WarnedMissingBlurEffect = false,
+	}, IsagiEffectRuntime)
+end
+
+function IsagiEffectRuntime:_effectKey(payload)
+	local sourcePlayer = payload.Player
+	local sequenceId = math.max(math.floor(tonumber(payload.SequenceId) or 0), 0)
+	if typeof(sourcePlayer) ~= "Instance"
+		or not sourcePlayer:IsA("Player")
+		or sequenceId <= 0
+	then
+		return nil
+	end
+	return tostring(sourcePlayer.UserId) .. ":" .. tostring(sequenceId)
+end
+
+function IsagiEffectRuntime:_resolveTemplate(templateName)
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	local effects = assets and assets:FindFirstChild("Effects")
+	local styles = effects and effects:FindFirstChild("Styles")
+	local isagi = styles and styles:FindFirstChild("Isagi")
+	local template = isagi and isagi:FindFirstChild(templateName)
+	if template and template:IsA("Model") then
+		return template
+	end
+
+	local key = tostring(templateName)
+	if not self.WarnedMissingTemplates[key] then
+		self.WarnedMissingTemplates[key] = true
+		warn(
+			"[IsagiEffectRuntime] Missing Isagi effect model "
+				.. tostring(templateName)
+		)
+	end
+	return nil
+end
+
+
+function IsagiEffectRuntime:_resolveTrailTemplate(templateName)
+	local assets = ReplicatedStorage:FindFirstChild("Assets")
+	local effects = assets and assets:FindFirstChild("Effects")
+	local styles = effects and effects:FindFirstChild("Styles")
+	local isagi = styles and styles:FindFirstChild("Isagi")
+	local template = isagi and isagi:FindFirstChild(templateName)
+	if template and template:IsA("BasePart") then
+		return template
+	end
+
+	local key = "Trail:" .. tostring(templateName)
+	if not self.WarnedMissingTemplates[key] then
+		self.WarnedMissingTemplates[key] = true
+		warn(
+			"[IsagiEffectRuntime] Missing Isagi trail BasePart "
+				.. tostring(templateName)
+		)
+	end
+	return nil
+end
+
+function IsagiEffectRuntime:_findTrailLimb(character, limbName)
+	if not character or not character.Parent then
+		return nil
+	end
+	local candidates = TRAIL_LIMB_CANDIDATES[limbName]
+	if type(candidates) ~= "table" then
+		return nil
+	end
+	for _, candidateName in ipairs(candidates) do
+		local candidate = character:FindFirstChild(candidateName)
+		if candidate and candidate:IsA("BasePart") then
+			return candidate
+		end
+	end
+	return nil
+end
+
+function IsagiEffectRuntime:_destroyTrailSession(session)
+	if not session then
+		return
+	end
+	session.Active = false
+
+	for _, connection in ipairs(session.Connections or {}) do
+		if connection then
+			connection:Disconnect()
+		end
+	end
+	table.clear(session.Connections or {})
+
+	for _, clone in ipairs(session.Clones or {}) do
+		if clone and clone.Parent then
+			clone:Destroy()
+		end
+	end
+	table.clear(session.Clones or {})
+end
+
+function IsagiEffectRuntime:_stopTrailSession(sessionMap, payload)
+	local key = self:_effectKey(payload)
+	if not key then
+		return
+	end
+	local session = sessionMap[key]
+	if not session then
+		return
+	end
+	sessionMap[key] = nil
+	self:_destroyTrailSession(session)
+end
+
+function IsagiEffectRuntime:_startTrailSession(
+	sessionMap,
+	payload,
+	trailConfig,
+	limbNames,
+	defaultDuration,
+	runtimePrefix
+)
+	local key = self:_effectKey(payload)
+	if not key then
+		return false
+	end
+
+	local old = sessionMap[key]
+	if old then
+		sessionMap[key] = nil
+		self:_destroyTrailSession(old)
+	end
+
+	trailConfig = type(trailConfig) == "table" and trailConfig or {}
+	if trailConfig.Enabled == false then
+		return false
+	end
+
+	local sourcePlayer = payload.Player
+	local character = sourcePlayer and sourcePlayer.Character
+	if not character or not character.Parent then
+		return false
+	end
+
+	local templateName = type(trailConfig.Template) == "string"
+		and trailConfig.Template ~= ""
+		and trailConfig.Template
+		or "IsagiTrail"
+	local template = self:_resolveTrailTemplate(templateName)
+	if not template then
+		return false
+	end
+
+	local offset = typeof(trailConfig.Offset) == "CFrame"
+		and trailConfig.Offset
+		or CFrame.new()
+	local session = {
+		Active = true,
+		Player = sourcePlayer,
+		Character = character,
+		SequenceId = math.max(math.floor(tonumber(payload.SequenceId) or 0), 0),
+		Clones = {},
+		Connections = {},
+	}
+
+	for _, limbName in ipairs(limbNames or {}) do
+		local limb = self:_findTrailLimb(character, limbName)
+		if limb then
+			local clone = template:Clone()
+			clone.Name = tostring(runtimePrefix or "RuntimeIsagiLimbTrail")
+				.. "_"
+				.. limbName
+				.. "_"
+				.. tostring(session.SequenceId)
+			configureTrailCarrier(clone)
+			local visualStates = captureAndDisableTrailVisuals(clone)
+			clone.CFrame = limb.CFrame * offset
+			clone.Parent = self.Parent
+
+			local weld = Instance.new("WeldConstraint")
+			weld.Name = "IsagiTrailWeld"
+			weld.Part0 = limb
+			weld.Part1 = clone
+			weld.Parent = clone
+
+			restoreTrailVisuals(visualStates)
+			table.insert(session.Clones, clone)
+		end
+	end
+
+	if #session.Clones == 0 then
+		self:_destroyTrailSession(session)
+		return false
+	end
+
+	sessionMap[key] = session
+	table.insert(session.Connections, character.Destroying:Connect(function()
+		if sessionMap[key] == session then
+			sessionMap[key] = nil
+			self:_destroyTrailSession(session)
+		end
+	end))
+	table.insert(session.Connections, sourcePlayer.AncestryChanged:Connect(function()
+		if not sourcePlayer.Parent and sessionMap[key] == session then
+			sessionMap[key] = nil
+			self:_destroyTrailSession(session)
+		end
+	end))
+
+	local duration = math.max(
+		tonumber(trailConfig.MaximumDuration)
+			or tonumber(payload.Duration)
+			or tonumber(defaultDuration)
+			or 1,
+		0.05
+	)
+	task.delay(duration, function()
+		if self.Destroyed then
+			return
+		end
+		if sessionMap[key] == session then
+			sessionMap[key] = nil
+			self:_destroyTrailSession(session)
+		end
+	end)
+	return true
+end
+
+function IsagiEffectRuntime:_startDirectShotChargeTrail(payload)
+	local trailConfig = type(payload.Trail) == "table" and payload.Trail or {}
+	local limbName = type(trailConfig.Limb) == "string"
+		and trailConfig.Limb
+		or "RightLeg"
+	self:_startTrailSession(
+		self.ActiveDirectShotChargeTrails,
+		payload,
+		trailConfig,
+		{ limbName },
+		1.50,
+		"RuntimeIsagiDirectShotChargeTrail"
+	)
+end
+
+function IsagiEffectRuntime:_stopDirectShotChargeTrail(payload)
+	self:_stopTrailSession(self.ActiveDirectShotChargeTrails, payload)
+end
+
+function IsagiEffectRuntime:_startOffBallTrails(payload)
+	local presentation = type(payload.Presentation) == "table"
+		and payload.Presentation
+		or {}
+	local trailConfig = type(presentation.LimbTrail) == "table"
+		and presentation.LimbTrail
+		or {}
+	local limbNames = type(trailConfig.Limbs) == "table"
+		and trailConfig.Limbs
+		or { "LeftArm", "RightArm", "LeftLeg", "RightLeg" }
+	self:_startTrailSession(
+		self.ActiveOffBallTrails,
+		payload,
+		trailConfig,
+		limbNames,
+		tonumber(payload.Duration) or 0.64,
+		"RuntimeIsagiOffBallTrail"
+	)
+end
+
+function IsagiEffectRuntime:_stopOffBallTrails(payload)
+	self:_stopTrailSession(self.ActiveOffBallTrails, payload)
+end
+
+function IsagiEffectRuntime:_resolveImpactFrame(payload)
+	local rotationOffset = typeof(payload.RotationOffset) == "CFrame"
+		and payload.RotationOffset
+		or CFrame.new()
+
+	if typeof(payload.Frame) == "CFrame" then
+		return payload.Frame * rotationOffset
+	end
+
+	local position = payload.Position
+	if typeof(position) ~= "Vector3" then
+		return nil
+	end
+
+	local direction = payload.FacingDirection
+	if typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then
+		direction = payload.Direction
+	end
+	if typeof(direction) ~= "Vector3" or direction.Magnitude < 0.001 then
+		direction = Vector3.new(0, 0, -1)
+	else
+		direction = Vector3.new(direction.X, 0, direction.Z)
+		direction = direction.Magnitude > 0.001
+			and direction.Unit
+			or Vector3.new(0, 0, -1)
+	end
+
+	return CFrame.lookAt(position, position + direction, Vector3.yAxis)
+		* rotationOffset
+end
+
+function IsagiEffectRuntime:_emitBurst(root, payload)
+	payload = type(payload) == "table" and payload or {}
+	local fallbackCount = math.max(
+		math.floor(tonumber(payload.FallbackEmitCount) or 12),
+		1
+	)
+	local minimumCount = math.max(
+		math.floor(tonumber(payload.MinimumEmitCount) or 1),
+		1
+	)
+	local maximumCount = math.max(
+		math.floor(tonumber(payload.MaximumEmitCount) or 160),
+		fallbackCount,
+		minimumCount
+	)
+	local countMultiplier = math.max(
+		tonumber(payload.EmitCountMultiplier) or 1,
+		0.05
+	)
+	local burstWindow = math.max(tonumber(payload.BurstWindow) or 0.14, 0.01)
+	local maximumDelay = 0
+
+	for _, object in ipairs(root:GetDescendants()) do
+		if object:IsA("ParticleEmitter") then
+			object.Enabled = false
+			object.LockedToPart = true
+
+			local authoredCount = tonumber(object:GetAttribute("EmitCount"))
+				or tonumber(object:GetAttribute("EmissionCount"))
+				or tonumber(object:GetAttribute("BurstCount"))
+				or tonumber(object:GetAttribute("ParticleCount"))
+				or tonumber(object:GetAttribute("Count"))
+
+			local count = authoredCount
+			if count == nil or count <= 0 then
+				local rateCount = math.floor(
+					math.max(tonumber(object.Rate) or 0, 0) * burstWindow + 0.5
+				)
+				count = math.max(rateCount, fallbackCount, minimumCount)
+			end
+			count = math.clamp(
+				math.floor(count * countMultiplier + 0.5),
+				minimumCount,
+				maximumCount
+			)
+
+			local emitDelay = math.max(
+				tonumber(object:GetAttribute("EmitDelay")) or 0,
+				0
+			)
+			maximumDelay = math.max(maximumDelay, emitDelay)
+
+			task.delay(emitDelay, function()
+				if self.Destroyed or not root.Parent or not object.Parent then
+					return
+				end
+				object.Enabled = false
+				pcall(function()
+					object:Clear()
+				end)
+				object:Emit(count)
+			end)
+		end
+	end
+
+	return maximumDelay
+end
+
+function IsagiEffectRuntime:_spawnDirectShotModel(template, frame, payload, key)
+	if not template or not template:IsA("Model") or typeof(frame) ~= "CFrame" then
+		return nil
+	end
+
+	payload = type(payload) == "table" and payload or {}
+	local meshConfig = type(payload.MeshTween) == "table" and payload.MeshTween or {}
+
+
+
+	local impactClone = template:Clone()
+	impactClone.Name = "RuntimeIsagiDirectShotImpact_" .. tostring(payload.SequenceId or 0)
+
+	for _, object in ipairs(impactClone:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Anchored = true
+			object.CanCollide = false
+			object.CanTouch = false
+			object.CanQuery = false
+			object.Massless = true
+			object.CastShadow = false
+			object.LocalTransparencyModifier = 0
+		elseif object:IsA("ParticleEmitter") then
+			object.Enabled = false
+			object.LockedToPart = true
+		end
+	end
+
+	local impactPart = impactClone.PrimaryPart
+	if not (impactPart and impactPart:IsA("BasePart") and impactPart:IsDescendantOf(impactClone)) then
+		impactPart = impactClone:FindFirstChild("Impact", true)
+		if impactPart and not impactPart:IsA("BasePart") then
+			impactPart = nil
+		end
+	end
+
+	local verticalOffset = tonumber(meshConfig.VerticalOffset) or 0
+	local forwardOffset = tonumber(meshConfig.ForwardOffset) or 0
+
+
+	local desiredY = frame.Position.Y + verticalOffset
+	if meshConfig.UsePlayerVerticalCenter ~= false then
+		local sourcePlayer = payload.Player
+		local character = sourcePlayer and sourcePlayer.Character
+		local characterRoot = character and character:FindFirstChild("HumanoidRootPart")
+		if characterRoot and characterRoot:IsA("BasePart") then
+			desiredY = characterRoot.Position.Y
+				+ (tonumber(meshConfig.PlayerHeightOffset) or 7)
+		end
+	end
+
+	local desiredAnchorFrame = CFrame.new(
+		frame.Position.X,
+		desiredY,
+		frame.Position.Z
+	) * frame.Rotation * CFrame.new(0, 0, -forwardOffset)
+
+
+	if impactPart then
+		local primaryDelta = desiredAnchorFrame * impactPart.CFrame:Inverse()
+		for _, object in ipairs(impactClone:GetDescendants()) do
+			if object:IsA("BasePart") then
+				object.CFrame = primaryDelta * object.CFrame
+			end
+		end
+		impactPart.CFrame = desiredAnchorFrame
+		impactPart.Transparency = 1
+		impactPart.LocalTransparencyModifier = 0
+	else
+		impactClone:PivotTo(desiredAnchorFrame)
+	end
+
+
+	local visualClone = impactClone:Clone()
+	visualClone.Name = "RuntimeIsagiDirectShotVisual_" .. tostring(payload.SequenceId or 0)
+
+	local visualImpact = visualClone:FindFirstChild("Impact", true)
+	if visualImpact then
+		visualImpact:Destroy()
+	end
+	for _, object in ipairs(visualClone:GetDescendants()) do
+		if object:IsA("ParticleEmitter") then
+			object:Destroy()
+		elseif object:IsA("BasePart") then
+			object.Anchored = true
+			object.CanCollide = false
+			object.CanTouch = false
+			object.CanQuery = false
+			object.Massless = true
+			object.CastShadow = false
+			object.LocalTransparencyModifier = 0
+		end
+	end
+
+	local visualOrigin = Instance.new("Part")
+	visualOrigin.Name = "DirectShotVisualOrigin"
+	visualOrigin.Size = Vector3.new(0.05, 0.05, 0.05)
+	visualOrigin.Transparency = 1
+	visualOrigin.Anchored = true
+	visualOrigin.CanCollide = false
+	visualOrigin.CanTouch = false
+	visualOrigin.CanQuery = false
+	visualOrigin.Massless = true
+	visualOrigin.CastShadow = false
+	visualOrigin.CFrame = desiredAnchorFrame
+	visualOrigin.Parent = visualClone
+	visualClone.PrimaryPart = visualOrigin
+
+
+	if meshConfig.FacePlayerDirection ~= false then
+		local referenceMesh = nil
+		for _, object in ipairs(visualClone:GetDescendants()) do
+			if object:IsA("BasePart")
+				and object ~= visualOrigin
+				and (object.Name == "Start" or object.Name == "End")
+			then
+				referenceMesh = object
+				break
+			end
+		end
+
+		if referenceMesh then
+			local targetReferenceFrame = faceFrameLaterallyForward(
+				referenceMesh.CFrame,
+				desiredAnchorFrame.LookVector
+			)
+			local rotationDelta = targetReferenceFrame.Rotation
+				* referenceMesh.CFrame.Rotation:Inverse()
+			local anchorPosition = desiredAnchorFrame.Position
+			local worldDelta = CFrame.new(anchorPosition)
+				* rotationDelta
+				* CFrame.new(-anchorPosition)
+
+			for _, object in ipairs(visualClone:GetDescendants()) do
+				if object:IsA("BasePart") and object ~= visualOrigin then
+					object.CFrame = worldDelta * object.CFrame
+				end
+			end
+		end
+	end
+
+
+	for _, object in ipairs(impactClone:GetDescendants()) do
+		if object:IsA("BasePart") then
+			object.Transparency = 1
+			object.LocalTransparencyModifier = object == impactPart and 0 or 1
+		end
+	end
+
+	local meshDuration = math.max(tonumber(meshConfig.Duration) or 0.72, 0.01)
+	local baseScale = math.clamp(tonumber(meshConfig.BaseScale) or 1, 0.1, 2)
+	local scaleMultiplier = math.max(tonumber(meshConfig.ScaleMultiplier) or 1.80, 1)
+	local rotationDegrees = typeof(meshConfig.RotationDegrees) == "Vector3"
+		and meshConfig.RotationDegrees
+		or Vector3.new(0, 0, 70)
+
+
+	local rotationOffset = CFrame.Angles(
+		0,
+		0,
+		math.rad(rotationDegrees.Z)
+	)
+	local tweenInfo = TweenInfo.new(
+		meshDuration,
+		resolveMeshEasingStyle(meshConfig.EasingStyle),
+		resolveMeshEasingDirection(meshConfig.EasingDirection)
+	)
+
+	local configuredNames = type(meshConfig.MeshNames) == "table"
+		and meshConfig.MeshNames
+		or { "Start", "End" }
+	local allowedNames = {}
+	for _, name in ipairs(configuredNames) do
+		if type(name) == "string" and name ~= "" then
+			allowedNames[name] = true
+		end
+	end
+	if next(allowedNames) == nil then
+		allowedNames.Start = true
+		allowedNames.End = true
+	end
+
+	-- Shrink every visual part once around Impact, preserving the relative layout.
+	-- The later expansion still grows Start/End in place without moving their centers.
+	local visualRecords = {}
+	if meshConfig.Enabled ~= false then
+		for _, object in ipairs(visualClone:GetDescendants()) do
+			if object:IsA("BasePart") and object ~= visualOrigin then
+				local offset = object.Position - desiredAnchorFrame.Position
+				object.CFrame = CFrame.new(
+					desiredAnchorFrame.Position + offset * baseScale
+				) * object.CFrame.Rotation
+				object.Size = object.Size * baseScale
+				local isTweenMesh = allowedNames[object.Name] == true
+				if isTweenMesh then
+					object.LocalTransparencyModifier = 0
+					object.Transparency = 0
+				end
+
+				table.insert(visualRecords, {
+					Part = object,
+					StartCFrame = object.CFrame,
+					StartSize = object.Size,
+					TweenMesh = isTweenMesh,
+				})
+			end
+		end
+	end
+
+	local runtimeRoot = Instance.new("Folder")
+	runtimeRoot.Name = "RuntimeIsagiDirectShot_" .. tostring(payload.SequenceId or 0)
+	runtimeRoot.Parent = self.Parent
+	impactClone.Parent = runtimeRoot
+	visualClone.Parent = runtimeRoot
+
+	if key then
+		local old = self.ActiveImpactRoots[key]
+		if old and old.Parent then
+			old:Destroy()
+		end
+		self.ActiveImpactRoots[key] = runtimeRoot
+	end
+
+
+	local emissionRoot = impactPart or impactClone
+	local maximumDelay = self:_emitBurst(emissionRoot, payload)
+
+	if meshConfig.Enabled ~= false then
+
+		local progress = Instance.new("NumberValue")
+		progress.Name = "DirectShotModelTweenProgress"
+		progress.Value = 0
+		progress.Parent = runtimeRoot
+
+		local startFrame = desiredAnchorFrame
+		local endFrame = desiredAnchorFrame * rotationOffset
+		local anchorPosition = desiredAnchorFrame.Position
+		local progressConnection
+		local function applyModelProgress(alpha)
+			if not visualClone.Parent then
+				return
+			end
+
+			alpha = math.clamp(tonumber(alpha) or 0, 0, 1)
+			local currentFrame = startFrame:Lerp(endFrame, alpha)
+			local rotationDelta = currentFrame.Rotation
+				* startFrame.Rotation:Inverse()
+			local worldDelta = CFrame.new(anchorPosition)
+				* rotationDelta
+				* CFrame.new(-anchorPosition)
+			local scale = 1 + (scaleMultiplier - 1) * alpha
+
+			for _, record in ipairs(visualRecords) do
+				local part = record.Part
+				if part and part.Parent then
+
+					part.CFrame = worldDelta * record.StartCFrame
+
+					if record.TweenMesh then
+
+						part.Size = record.StartSize * scale
+						
+						part.Transparency = alpha
+					end
+				end
+			end
+		end
+
+		progressConnection = progress:GetPropertyChangedSignal("Value"):Connect(function()
+			applyModelProgress(progress.Value)
+		end)
+		applyModelProgress(0)
+
+		local modelTween = TweenService:Create(progress, tweenInfo, { Value = 1 })
+		modelTween.Completed:Once(function()
+			if progressConnection then
+				progressConnection:Disconnect()
+				progressConnection = nil
+			end
+			if progress.Parent then
+				progress:Destroy()
+			end
+		end)
+		modelTween:Play()
+	end
+
+	local cleanupTime = math.max(
+		tonumber(payload.Duration) or 1.5,
+		meshDuration + 0.10,
+		maximumDelay + getParticleLifetime(emissionRoot) + 0.30,
+		0.30
+	)
+	Debris:AddItem(runtimeRoot, cleanupTime)
+	if key then
+		task.delay(cleanupTime + 0.05, function()
+			if self.ActiveImpactRoots[key] == runtimeRoot then
+				self.ActiveImpactRoots[key] = nil
+			end
+		end)
+	end
+	return runtimeRoot
+end
+
+function IsagiEffectRuntime:_cancelFovTweens(restoreNow)
+	self.FovToken += 1
+	for _, tween in ipairs({ self.FovTween, self.FovReturnTween }) do
+		if tween then
+			pcall(function()
+				tween:Cancel()
+			end)
+		end
+	end
+	self.FovTween = nil
+	self.FovReturnTween = nil
+
+	if restoreNow == true then
+		local camera = self.FovCamera
+		if camera and Workspace.CurrentCamera == camera then
+			camera.FieldOfView = tonumber(self.FovRestore) or 70
+		end
+		self.FovCamera = nil
+		self.FovRestore = nil
+	end
+end
+
+function IsagiEffectRuntime:_playImpactFov(config)
+	config = type(config) == "table" and config or {}
+	if config.Enabled == false then
+		return
+	end
+
+	local camera = Workspace.CurrentCamera
+	if not camera then
+		return
+	end
+
+	self:_cancelFovTweens(false)
+	local token = self.FovToken
+	self.FovCamera = camera
+	self.FovRestore = camera.FieldOfView
+
+	local impact = math.clamp(tonumber(config.Impact) or 120, 1, 170)
+	local outDuration = math.max(tonumber(config.OutDuration) or 0.10, 0.01)
+	local normal = math.clamp(tonumber(config.Normal) or 70, 1, 170)
+	local returnDuration = math.max(tonumber(config.ReturnDuration) or 0.20, 0.01)
+
+	local outTween = TweenService:Create(
+		camera,
+		TweenInfo.new(outDuration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ FieldOfView = impact }
+	)
+	self.FovTween = outTween
+	outTween.Completed:Once(function(playbackState)
+		if self.Destroyed
+			or token ~= self.FovToken
+			or playbackState ~= Enum.PlaybackState.Completed
+		then
+			return
+		end
+		if self.FovTween == outTween then
+			self.FovTween = nil
+		end
+		if Workspace.CurrentCamera ~= camera then
+			self.FovCamera = nil
+			self.FovRestore = nil
+			return
+		end
+
+		local returnTween = TweenService:Create(
+			camera,
+			TweenInfo.new(returnDuration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+			{ FieldOfView = normal }
+		)
+		self.FovReturnTween = returnTween
+		returnTween.Completed:Once(function()
+			if self.Destroyed or token ~= self.FovToken then
+				return
+			end
+			if self.FovReturnTween == returnTween then
+				self.FovReturnTween = nil
+			end
+			self.FovCamera = nil
+			self.FovRestore = nil
+		end)
+		returnTween:Play()
+	end)
+	outTween:Play()
+end
+
+function IsagiEffectRuntime:_getColorEffect()
+	if self.ColorEffect and self.ColorEffect.Parent then
+		return self.ColorEffect
+	end
+
+	local effect = Lighting:FindFirstChild("IsagiDirectShotImpactColor")
+	if effect and not effect:IsA("ColorCorrectionEffect") then
+		effect:Destroy()
+		effect = nil
+	end
+	if not effect then
+		effect = Instance.new("ColorCorrectionEffect")
+		effect.Name = "IsagiDirectShotImpactColor"
+		effect.Parent = Lighting
+	end
+	effect.Enabled = true
+	effect.Brightness = 0
+	effect.Contrast = 0
+	effect.Saturation = 0
+	effect.TintColor = Color3.new(1, 1, 1)
+	self.ColorEffect = effect
+	return effect
+end
+
+function IsagiEffectRuntime:_playColorPulse(config)
+	config = type(config) == "table" and config or {}
+	if config.Enabled == false then
+		return
+	end
+
+	self.ColorToken += 1
+	local token = self.ColorToken
+	if self.ColorTween then
+		self.ColorTween:Cancel()
+		self.ColorTween = nil
+	end
+
+	local effect = self:_getColorEffect()
+	effect.Enabled = true
+	effect.TintColor = typeof(config.TintColor) == "Color3"
+		and config.TintColor
+		or Color3.fromRGB(35, 255, 110)
+	effect.Brightness = tonumber(config.Brightness) or 0.12
+	effect.Contrast = tonumber(config.Contrast) or 0.55
+	effect.Saturation = tonumber(config.Saturation) or 0.12
+
+	local duration = math.max(tonumber(config.FadeDuration) or 0.50, 0.01)
+	local tween = TweenService:Create(
+		effect,
+		TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{
+			TintColor = Color3.new(1, 1, 1),
+			Brightness = 0,
+			Contrast = 0,
+			Saturation = 0,
+		}
+	)
+	self.ColorTween = tween
+	tween.Completed:Once(function()
+		if self.Destroyed or token ~= self.ColorToken then
+			return
+		end
+		if self.ColorTween == tween then
+			self.ColorTween = nil
+		end
+		if effect.Parent then
+			effect.Enabled = false
+		end
+	end)
+	tween:Play()
+end
+
+function IsagiEffectRuntime:_resolveBlurEffect(config)
+	config = type(config) == "table" and config or {}
+	local effectName = type(config.EffectName) == "string"
+		and config.EffectName ~= ""
+		and config.EffectName
+		or "BlurEffect"
+
+	local cached = self.BlurEffect
+	if cached and cached.Parent and cached.Name == effectName then
+		return cached
+	end
+
+	local effect = Lighting:FindFirstChild(effectName)
+	if effect and effect:IsA("BlurEffect") then
+		self.BlurEffect = effect
+		self.BlurBaselineSize = math.max(tonumber(effect.Size) or 0, 0)
+		self.BlurBaselineEnabled = effect.Enabled
+		return effect
+	end
+
+	if not self.WarnedMissingBlurEffect then
+		self.WarnedMissingBlurEffect = true
+		warn("[IsagiEffectRuntime] Expected Lighting." .. effectName .. " to be a BlurEffect")
+	end
+	return nil
+end
+
+function IsagiEffectRuntime:_restoreBlur(effect, token)
+	if self.Destroyed or token ~= self.BlurToken or not effect or not effect.Parent then
+		return
+	end
+	effect.Size = math.max(tonumber(self.BlurBaselineSize) or 0, 0)
+	if self.BlurBaselineEnabled ~= nil then
+		effect.Enabled = self.BlurBaselineEnabled == true
+	end
+end
+
+function IsagiEffectRuntime:_playBlurPulse(config)
+	config = type(config) == "table" and config or {}
+	if config.Enabled == false then
+		return
+	end
+
+	local effect = self:_resolveBlurEffect(config)
+	if not effect then
+		return
+	end
+
+	self.BlurToken += 1
+	local token = self.BlurToken
+	if self.BlurTween then
+		self.BlurTween:Cancel()
+		self.BlurTween = nil
+	end
+
+	local baselineSize = math.max(tonumber(self.BlurBaselineSize) or 0, 0)
+	local impactSize = math.clamp(tonumber(config.ImpactSize) or 24, 0, 56)
+	local duration = math.max(tonumber(config.ReturnDuration) or 0.40, 0.01)
+	effect.Enabled = true
+	effect.Size = impactSize
+
+	local tween = TweenService:Create(
+		effect,
+		TweenInfo.new(duration, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{ Size = baselineSize }
+	)
+	self.BlurTween = tween
+	tween.Completed:Once(function()
+		if self.Destroyed or token ~= self.BlurToken then
+			return
+		end
+		if self.BlurTween == tween then
+			self.BlurTween = nil
+		end
+		self:_restoreBlur(effect, token)
+	end)
+	tween:Play()
+	task.delay(duration + 0.08, function()
+		self:_restoreBlur(effect, token)
+	end)
+end
+
+function IsagiEffectRuntime:_playImpact(payload)
+	local key = self:_effectKey(payload)
+	if not key or self.PlayedImpacts[key] then
+		return
+	end
+
+	self.PlayedImpacts[key] = true
+	task.delay(8, function()
+		self.PlayedImpacts[key] = nil
+	end)
+
+	local templateName = type(payload.EffectName) == "string"
+		and payload.EffectName ~= ""
+		and payload.EffectName
+		or "DirectShot"
+	local template = self:_resolveTemplate(templateName)
+	local frame = self:_resolveImpactFrame(payload)
+	if template and frame then
+		self:_spawnDirectShotModel(template, frame, payload, key)
+	end
+
+	if payload.Player == self.LocalPlayer then
+		local presentation = type(payload.Presentation) == "table"
+			and payload.Presentation
+			or {}
+		self:_playImpactFov(presentation.Fov)
+		self:_playColorPulse(presentation.ColorCorrection)
+		self:_playBlurPulse(presentation.Blur)
+	end
+end
+
+function IsagiEffectRuntime:Handle(actionName, payload)
+	if self.Destroyed then
+		return false
+	end
+	payload = type(payload) == "table" and payload or {}
+
+	if actionName == "IsagiDirectShotStarted" then
+		self:_startDirectShotChargeTrail(payload)
+		return true
+	end
+
+	if actionName == "IsagiDirectShotImpact" then
+		-- The charge trail exists only before the authored Shoot marker.
+		self:_stopDirectShotChargeTrail(payload)
+		self:_playImpact(payload)
+		return true
+	end
+
+	if actionName == "IsagiDirectShotResult" then
+	
+		self:_stopDirectShotChargeTrail(payload)
+		return true
+	end
+
+	if actionName == "IsagiOffTheBallMovementDash" then
+		self:_startOffBallTrails(payload)
+		return true
+	end
+
+	if actionName == "IsagiOffTheBallMovementResult" then
+		self:_stopOffBallTrails(payload)
+		return true
+	end
+
+	return false
+end
+
+function IsagiEffectRuntime:Reset()
+	if self.Destroyed then
+		return
+	end
+
+	for key, root in pairs(self.ActiveImpactRoots) do
+		self.ActiveImpactRoots[key] = nil
+		if root and root.Parent then
+			root:Destroy()
+		end
+	end
+
+	for key, session in pairs(self.ActiveDirectShotChargeTrails) do
+		self.ActiveDirectShotChargeTrails[key] = nil
+		self:_destroyTrailSession(session)
+	end
+	for key, session in pairs(self.ActiveOffBallTrails) do
+		self.ActiveOffBallTrails[key] = nil
+		self:_destroyTrailSession(session)
+	end
+	table.clear(self.PlayedImpacts)
+
+	self:_cancelFovTweens(true)
+
+	self.ColorToken += 1
+	if self.ColorTween then
+		self.ColorTween:Cancel()
+		self.ColorTween = nil
+	end
+	if self.ColorEffect and self.ColorEffect.Parent then
+		self.ColorEffect.Enabled = false
+		self.ColorEffect.TintColor = Color3.new(1, 1, 1)
+		self.ColorEffect.Brightness = 0
+		self.ColorEffect.Contrast = 0
+		self.ColorEffect.Saturation = 0
+	end
+
+	self.BlurToken += 1
+	if self.BlurTween then
+		self.BlurTween:Cancel()
+		self.BlurTween = nil
+	end
+	if self.BlurEffect and self.BlurEffect.Parent then
+		self.BlurEffect.Size = math.max(tonumber(self.BlurBaselineSize) or 0, 0)
+		if self.BlurBaselineEnabled ~= nil then
+			self.BlurEffect.Enabled = self.BlurBaselineEnabled == true
+		end
+	end
+end
+
+function IsagiEffectRuntime:Destroy()
+	if self.Destroyed then
+		return
+	end
+	self:Reset()
+	self.Destroyed = true
+
+	if self.ColorEffect and self.ColorEffect.Parent then
+		self.ColorEffect:Destroy()
+	end
+	self.ColorEffect = nil
+
+	-- BlurEffect belongs to Lighting/the game, so only restore it; never destroy it.
+	if self.BlurEffect and self.BlurEffect.Parent then
+		self.BlurEffect.Size = math.max(tonumber(self.BlurBaselineSize) or 0, 0)
+		if self.BlurBaselineEnabled ~= nil then
+			self.BlurEffect.Enabled = self.BlurBaselineEnabled == true
+		end
+	end
+	self.BlurEffect = nil
+end
+
+return IsagiEffectRuntime
