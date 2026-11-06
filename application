@@ -718,8 +718,7 @@ function IsagiEffectRuntime:_spawnDirectShotModel(template, frame, payload, key)
 		allowedNames.End = true
 	end
 
-	-- Shrink every visual part once around Impact, preserving the relative layout.
-	-- The later expansion still grows Start/End in place without moving their centers.
+
 	local visualRecords = {}
 	if meshConfig.Enabled ~= false then
 		for _, object in ipairs(visualClone:GetDescendants()) do
